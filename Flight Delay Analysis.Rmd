@@ -1,0 +1,267 @@
+---
+title: "FlightDelay"
+author: "Group 6"
+date: "2022-12-07"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(RSQLite)
+library(modelr)
+library(arrow)
+library(dplyr)
+```
+Reading in flight data from 2018 - 2022 using smaller .parquet files to limit size
+```{r}
+#Data from Kaggle: https://www.kaggle.com/datasets/robikscube/flight-delay-dataset-20182022?select=Combined_Flights_2022.csv
+con <- dbConnect(SQLite(), "flight_data.db")
+```
+
+```{r}
+path <- "C:/Users/chase/OneDrive/Northeastern Code/DS 5110/Group Project/data/Combined_Flights_2021.parquet"
+flights_2021 <- read_parquet(path, as_data_frame = TRUE) #read in flight data
+dbWriteTable(con, "flights", flights_2021) #initializing flights df
+rm(flights_2021) #dropping df from environment to minimize memory usage
+```
+
+```{r} 
+df <- as_tibble(dbGetQuery(con, 
+           "SELECT FlightDate
+                 , Airline
+                 , Origin
+                 , Dest
+                 , Cancelled
+                 , Diverted
+                 , DepTime
+                 , DepDelayMinutes
+                 , Distance
+                 , DistanceGroup
+                 , Year
+                 , Quarter
+                 , Month
+                 , DayofMonth
+                 , DayofWeek
+                 , Marketing_Airline_Network
+                 , OriginAirportID
+                 , OriginCityName
+                 , OriginStateName
+                 , OriginWAC
+                 , DestAirportID
+                 , DestCityName
+                 , DestStateName
+                 , DestWac
+                 , CRSDepTime
+                 , CRSElapsedTime
+                 , ArrDelayMinutes
+                 FROM flights
+           WHERE Operating_airline in ('AA', 'UA', 'DL')
+          AND OriginWac BETWEEN 1 AND 93
+          AND DestWac BETWEEN 1 AND 93"))
+df$OriginEncode <- as.numeric(as.factor(df$Origin))
+df$DestEncoder <- as.numeric(as.factor(df$Dest))
+ggplot(df, aes(x=DepDelayMinutes)) +
+  geom_histogram() + 
+  theme_minimal()
+df <- na.omit(df)
+```
+We can see that departure delay is very frequently zero or near zero
+```{r}
+#Compartmentalize States into Census defined regions for analysis
+Northeast <- c("Connecticut", "Maine", "Massachusetts", "New Hampshire", "Rhode Island", "Vermont", "New Jersey", "New York", "Pennsylvania", "Washington D.C.")
+Midwest <- c("Illinois", "Indiana", "Michigan", "Ohio", "Wisconsin", "Iowa", "Kansas", "Minnesota", "Missouri", "Nebraska", "North Dakota", "South Dakota")
+South <- c("Florida", "Georgia", "North Carolina", "South Carolina", "Virginia", "West Virginia", "Alabama", "Kentucky", "Mississippi", "Tennessee", "Arkansas", "Louisiana", "Oklahoma", "Texas", "Delaware", "Maryland", "U.S. Virgin Islands", "Puerto Rico")
+West <- c("Arizona", "Colorado", "Idaho", "Montana", "Nevada", "New Mexico", "Utah", "Wyoming", "Alaska", "California", "Hawaii", "Oregon", "Washington", "U.S. Pacific Trust Territories and Possessions")
+df <- df %>% 
+  mutate(OriginRegion = case_when(
+    OriginStateName %in% Northeast ~ "Northeast",
+    OriginStateName %in% Midwest ~ "Midwest",
+    OriginStateName %in% South ~ "South",
+    OriginStateName %in% West ~ "West"
+  ), .after = OriginStateName
+)
+df <- df %>%
+  mutate(DestRegion = case_when(
+    DestStateName %in% Northeast ~ "Northeast",
+    DestStateName %in% Midwest ~ "Midwest",
+    DestStateName %in% South ~ "South",
+    DestStateName %in% West ~ "West"
+  ), .after = DestStateName
+)
+#Partitioning data
+df_part <- resample_partition(df,
+                                    p=c(train=0.5,
+                                        valid=0.25,
+                                        test=0.25))
+```
+We re-encode region variables into quadrants based on US Census region data, in order to allow for greater interpretability.
+```{r}
+# Downsampling with 80% data.
+df1 <- (df %>% filter(Airline=="Delta Air Lines Inc.", DepDelayMinutes==0))[427224:534031,]
+df2 <- (df %>% filter(Airline=="United Air Lines Inc.", DepDelayMinutes==0))[225760:282200,]
+df3 <- (df %>% filter(Airline=="American Airlines Inc.", DepDelayMinutes==0))[377192:471490,]
+df4 <-  (df %>% filter(DepDelayMinutes!=0))
+df_down <- rbind(df1,df2,df3, df4)
+dim(df_down)
+
+interval <- function(x) {
+  case_when(
+    x == 0 ~ "On Time",
+    between(x, 1, 60) ~ "Less Delay",
+    between(x, 61, 120) ~ "Medium Delay",
+    x >= 121 ~ "Large Delay"
+  )
+}
+df_down$DepDelayclass<-interval(df_down$DepDelayMinutes)
+df_down %>%
+  select(Airline, DepDelayclass) %>%
+  group_by(DepDelayclass, Airline) %>%
+  summarise(n())
+ggplot(df_down,aes(x = DepDelayclass, fill = Airline)) + geom_bar(stat="count",position = "dodge")
+#Partitioning data
+df_down_part <- resample_partition(df_down,
+                                    p=c(train=0.5,
+                                        valid=0.25,
+                                        test=0.25))
+```
+Downsampling here allows us to even out our significant class imbalance
+```{r}
+#function to perform single step of stepwise model selection using RMSE, inspired by lecture (r markdown) code.
+step <- function(response, predictors, candidates, partition)
+{
+  rhs <- paste0(paste0(predictors, collapse="+"), "+", candidates)
+  formulas <- lapply(paste0(response, "~", rhs), as.formula)
+  rmses <- sapply(formulas,
+                  function(fm) rmse(lm(fm, data=partition$train),
+                                    data=partition$valid))
+  names(rmses) <- candidates
+  attr(rmses, "best") <- rmses[which.min(rmses)]
+  rmses
+}
+```
+
+Stepwise
+
+```{r}
+df <- df %>% filter(DepDelayMinutes!=0)
+#initalizing model variable
+model <- NULL
+```
+OriginRegion: No Region seems to strongly effect log(DepDelayMinutes)
+DestRegion: No Region seems to strongly effect log(DepDelayMinutes)
+Airline: Doesn't seem highly significant, though American probably highest
+Distance: Hard to tell, but appears fairly linear with log(Distance)
+DistanceGroup: Unclear if significant
+Quarter: 3 slightly higher, not significant seeming
+Month: 6-8 appear slightly higher
+DayofMonth: Cant tell if any are higher
+DayofWeek: Cant tell if any are higher
+
+
+Using our forward stepwise function we select the most significant variable for predicting Departure Delay with each iteration
+```{r}
+preds <- "1"
+cands <- c("OriginEncode", "DestEncoder", "Airline", "Distance","DistanceGroup", "Quarter", "Month", "DayofMonth", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+
+```{r}
+preds <- c("Airline")
+cands <- c("OriginEncode", "DestEncoder", "Month", "Distance","DistanceGroup", "Quarter", "DayofMonth", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+```{r}
+preds <- c("Month", "Airline")
+cands <- c("OriginEncode", "DestEncoder", "Distance","DistanceGroup", "Quarter", "DayofMonth", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+```{r}
+preds <- c("Month", "Airline", "Quarter")
+cands <- c("Distance", "DestEncoder","DistanceGroup", "OriginEncode", "DayofMonth", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+```{r}
+preds <- c("Month", "Airline", "Quarter", "OriginEncode")
+cands <- c("DestEncoder","DistanceGroup", "Distance", "DayofMonth", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+```{r}
+preds <- c("Month", "Airline", "Distance", "OriginEncode", "Quarter")
+cands <- c("DestEncoder","DistanceGroup", "DayOfWeek", "DayofMonth")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+```{r}
+preds <- c("Month", "Airline", "Distance", "OriginEncode", "Quarter", "DayofMonth")
+cands <- c("DestEncoder","DistanceGroup", "DayOfWeek")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+```{r}
+preds <- c("Month", "Airline", "Distance", "OriginEncode", "Quarter", "DayofMonth", "DayOfWeek")
+cands <- c("DestEncoder","DistanceGroup")
+s1 <- step("log1p(DepDelayMinutes)", preds, cands, df_down_part)
+model <- c(model, attr(s1, "best"))
+s1
+```
+
+```{r}
+step_model <- tibble(index=seq_along(model),
+                     variable=factor(names(model), levels=names(model)),
+                     RMSE=model)
+ggplot(step_model, aes(y=RMSE)) +
+  geom_point(aes(x=variable)) +
+  geom_line(aes(x=index)) +
+  labs(title="Stepwise model selection") +
+  theme_minimal()
+```
+Here we plot the step-wise function to determine the decrease in RMSE each variable's inclusion gives us.
+
+```{r}
+fitting <- lm(log1p(DepDelayMinutes) ~ OriginEncode + Airline + Month + Distance + Quarter, data =df_down_part$train)
+rmse(fitting, df_down_part$test)
+summary(fitting)
+```
+We chose to select Origin, Airline, Month, Distance, and Quarter as our variables for prediction, as including the next variables did not give large RMSE decreases, and could result in overfitting.
+
+# Code for DepDelayMinutes=0 condition.
+Finally, we consider the effect of removing rows where Departure Delay = 0, this gives us a much more normal distribution of residuals, and shows that it may be good to separate this analysis into two tasks, prediction of Delayed vs Not-Delayed, and separately, if delayed, by how much?
+```{r}
+# Trying depDelayMinutes=0 condition.
+df <- df %>% filter(DepDelayMinutes!=0)
+fitting <- lm(log10(DepDelayMinutes) ~ OriginEncode + DestEncoder + Airline + Month + Distance + DayofMonth + DayOfWeek + DepTime, data =df)
+df %>% add_residuals(fitting, "resid") %>%
+  ggplot(aes(x=resid)) +
+  geom_histogram() + 
+  theme_minimal()
+```
+
+
+```{r}
+df %>%
+add_residuals(fitting, "resid") %>%
+ggplot(aes(sample=resid)) +
+geom_qq() +
+labs(title="QQ plot is approximately normal", y="residuals")+
+theme(plot.title=element_text(hjust=0.5, color="red"))
+```
